@@ -1,7 +1,7 @@
 ECE324 Project
 ==============================
 
-A short description of the project.
+A classifier for different skin diseases using a Convolutional Neural Network.
 
 Project Organization
 ------------
