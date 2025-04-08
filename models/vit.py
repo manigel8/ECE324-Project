@@ -1,127 +1,193 @@
+#the code for this vision transformer was found on the following github
+#https://github.com/miladfa7/Image-Classification-Vision-Transformer/blob/master/notebooks/ViT-Model-Brain-Tumor-Detection.ipynb
+
+#the actual vision transformer model is the following "google/vit-base-patch16-224-in21k" from Google and Hugging Face
+
 import torch
-from torch import nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import torch.optim as optim
+import torch.nn as nn
+import torchvision.transforms as transforms
+from transformers import ViTForImageClassification
+from torchvision import datasets
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import random
+from PIL import Image
+import os
+from collections import Counter
 
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
+# Preprocessing and Dataset Setup
+# Define transform
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
-# helpers
+# Load the dataset
+train_data_path = '/content/interim'  
+train_dataset = datasets.ImageFolder(root=train_data_path, transform=transform)
+num_classes = len(train_dataset.classes)
+print(f"Detected {num_classes} classes: {train_dataset.classes}")
 
-def pair(t):
-    return t if isinstance(t, tuple) else (t, t)
+# Labels to apply synthetic augmentation to
+labels_to_transform = list(range(num_classes))
 
-# classes
+# Custom Dataset with optional synthetic augmentation
+class CustomDataset(Dataset):
+    def __init__(self, real_data, labels_to_generate, transform=None):
+        self.real_data = real_data
+        self.labels_to_generate = labels_to_generate
+        self.transform = transform
+        self.samples = self.real_data.samples
+        self.loader = self.real_data.loader
+        self.base_transform = self.real_data.transform
+        self.class_to_idx = getattr(self.real_data, 'class_to_idx', {})
+        self.classes = getattr(self.real_data, 'classes', [])
 
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout = 0.):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
+        self.class_counts = {}
+        self.target_class_indices = {label: [] for label in self.labels_to_generate}
+        for idx, (_, label) in enumerate(self.samples):
+            self.class_counts[label] = self.class_counts.get(label, 0) + 1
+            if label in self.labels_to_generate:
+                self.target_class_indices[label].append(idx)
 
-    def forward(self, x):
-        return self.net(x)
+        self.synthetic_samples_per_label = {}
+        self.total_synthetic_samples = 0
+        max_class_count = max(self.class_counts.values()) if self.class_counts else 0
+        for label in self.labels_to_generate:
+            if self.class_counts.get(label, 0) < max_class_count:
+                samples_needed = 500
+                self.synthetic_samples_per_label[label] = samples_needed
+                self.total_synthetic_samples += samples_needed
+            else:
+                self.synthetic_samples_per_label[label] = 0
 
-class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
-        super().__init__()
-        inner_dim = dim_head *  heads
-        project_out = not (heads == 1 and dim_head == dim)
+        self.synthetic_index_map = [label for label in self.labels_to_generate
+                                    for _ in range(self.synthetic_samples_per_label.get(label, 0))]
+        self.synthetic_cache = {}
 
-        self.heads = heads
-        self.scale = dim_head ** -0.5
+    def __len__(self):
+        return len(self.samples) + self.total_synthetic_samples
 
-        self.norm = nn.LayerNorm(dim)
+    def __getitem__(self, idx):
+        if idx >= len(self.samples):
+            synthetic_idx = idx - len(self.samples)
+            if synthetic_idx in self.synthetic_cache:
+                return self.synthetic_cache[synthetic_idx]
+            label = self.synthetic_index_map[synthetic_idx]
+            sample = self._generate_synthetic_sample(label)
+            self.synthetic_cache[synthetic_idx] = sample
+            return sample
 
-        self.attend = nn.Softmax(dim = -1)
-        self.dropout = nn.Dropout(dropout)
+        path, label = self.samples[idx]
+        image = self.loader(path)
+        image = self.transform(image) if label in self.labels_to_generate else self.base_transform(image)
+        return image, label
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+    def _generate_synthetic_sample(self, label):
+        if not self.target_class_indices[label]:
+            image = self.loader(self.samples[0][0])
+        else:
+            idx = random.choice(self.target_class_indices[label])
+            image = self.loader(self.samples[idx][0])
+        return self.transform(image), label
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
+# Build augmented dataset
+augmented_dataset = CustomDataset(train_dataset, labels_to_transform, transform=transform)
 
-    def forward(self, x):
-        x = self.norm(x)
+# Check label distribution
+label_counter = Counter(label for _, label in augmented_dataset)
+for label in labels_to_transform:
+    label_counter[label] += augmented_dataset.synthetic_samples_per_label.get(label, 0)
+print(f"Label distribution: {dict(label_counter)}")
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+plt.bar(label_counter.keys(), label_counter.values())
+plt.xlabel("Classes")
+plt.ylabel("Number of Images")
+plt.show()
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+# Split data
+train_size = int(0.8 * len(augmented_dataset))
+test_size = len(augmented_dataset) - train_size
+train_dataset, test_dataset = random_split(augmented_dataset, [train_size, test_size])
 
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+# Load pre-trained ViT from Google and Hugging Face
+model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224-in21k")
 
-class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
-                FeedForward(dim, mlp_dim, dropout = dropout)
-            ]))
+# Need to override classifier head
+model.classifier = nn.Linear(model.classifier.in_features, num_classes)
 
-    def forward(self, x):
-        for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
+# Set device (force CPU if debugging)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
 
-        return self.norm(x)
+# Training & Evaluation
 
-class ViT(nn.Module):
-    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, pool = 'cls', channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0.):
-        super().__init__()
-        image_height, image_width = pair(image_size)
-        patch_height, patch_width = pair(patch_size)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+def train_model(model, loader, criterion, optimizer, device, num_epochs=10):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss, correct, total = 0.0, 0, 0
+        for images, labels in loader:
+            if labels.max() >= num_classes or labels.min() < 0:
+                print(f" Invalid label found in batch: {labels}")
+                continue
 
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
-        patch_dim = channels * patch_height * patch_width
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs.logits, labels)
 
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim),
-        )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.dropout = nn.Dropout(emb_dropout)
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.logits, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        acc = 100 * correct / total
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss:.4f}, Accuracy: {acc:.2f}%")
 
-        self.pool = pool
-        self.to_latent = nn.Identity()
+def evaluate_model(model, loader, device):
+    model.eval()
+    correct, total = 0, 0
+    all_preds, all_labels = [], []
 
-        self.mlp_head = nn.Linear(dim, num_classes)
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.logits, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            all_preds += predicted.cpu().tolist()
+            all_labels += labels.cpu().tolist()
 
-    def forward(self, img):
-        x = self.to_patch_embedding(img)
-        b, n, _ = x.shape
+    acc = 100 * correct / total
+    print(f"\nTest Accuracy: {acc:.2f}%")
+    return all_labels, all_preds
 
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :(n + 1)]
-        x = self.dropout(x)
+train_model(model, train_loader, criterion, optimizer, device, num_epochs=10)
+y_true, y_pred = evaluate_model(model, test_loader, device)
 
-        x = self.transformer(x)
-
-        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
-
-        x = self.to_latent(x)
-        return self.mlp_head(x)
+plt.figure(figsize=(10, 8))
+cm = confusion_matrix(y_true, y_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=train_dataset.dataset.classes,
+            yticklabels=train_dataset.dataset.classes)
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("ViT Confusion Matrix")
+plt.xticks(rotation=90)
+plt.tight_layout()
+plt.show()
